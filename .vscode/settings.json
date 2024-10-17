@@ -1,0 +1,28 @@
+{
+    "files.associations": {
+        "unistd.h": "c",
+        "cerrno": "c",
+        "stdbool.h": "c",
+        "signal.h": "c",
+        "array": "c",
+        "bitset": "c",
+        "string_view": "c",
+        "hash_map": "c",
+        "hash_set": "c",
+        "format": "c",
+        "initializer_list": "c",
+        "span": "c",
+        "valarray": "c",
+        "any": "c",
+        "optional": "c",
+        "variant": "c",
+        "*.tcc": "c",
+        "memory_resource": "c",
+        "cmath": "c",
+        "complex": "c",
+        "chrono": "c",
+        "functional": "c",
+        "cstdlib": "c",
+        "stdio.h": "c"
+    }
+}
