@@ -34,8 +34,6 @@ const struct in6_addr HOST_ADDR = IN6ADDR_LOOPBACK_INIT;
 #else
 const struct in_addr HOST_ADDR = {.s_addr = HTON_IP(0, 0, 0, 0)};
 #endif
-// constexpr ensures compile-timeness (const just ensures it's read-only)
-// constexpr const struct in_addr HOST_ADDR = {.s_addr = HTON_IP(127,0,0,1)};
 const int PAGE_SIZE = 4096;
 const int TRUE = 1;
 const struct timeval TIMEOUT = {
@@ -43,7 +41,7 @@ const struct timeval TIMEOUT = {
 };
 
 #define HTTP_NEWLINE "\r\n"
-#define HTTP_END "\r\n\r\n" // used for 1. header-content separator, 2. end of content
+#define HTTP_END "\r\n\r\n"
 #define HTTP_OK "HTTP/1.1 200 OK"
 #define HTTP_BAD_REQUEST_HEADER "HTTP/1.1 400 Bad Request"HTTP_END
 #define HTTP_MISSING_HEADER "HTTP/1.1 404 Not Found"HTTP_END
@@ -126,6 +124,7 @@ int parse_header(char* header, HttpHeader* o) {
     log("requesting resource: %s", o->resource);
 
     char *file_ext_str = strrchr(o->resource, (int)'.');
+    if (file_ext_str > strrchr(o->resource, (int)'\n')) file_ext_str = NULL;
     o->content_type = "";
     if (file_ext_str) {
         for (size_t i = 0; i < countof(content_type_ext); i++) {
@@ -139,18 +138,17 @@ int parse_header(char* header, HttpHeader* o) {
 
     char* version_str = strtok_r(NULL, "\n", &position);
     if (!version_str || cstrncmp(version_str, "HTTP/1.1") != 0) return -1;
-    // iterate over attributes
+    // iterate over attributes in `Key: Value\r\n` format
     for (;;) {
         position = strchr(position, '\n')+1;
-        if (*position == '\r' || // \r\n\r\n
-            *position == '\00' || // may happen if there is an empty newline
-            !position)
-            break;
-        if (cstrncmp(position, "Connection") == 0) {
+        if (NULL == position  || //     vv end of http request header
+            *position == '\r' || // \r\n\r\n
+            *position == '\0'   // may happen if there is an empty newline
+        ) break;
+        if (0 == cstrncmp(position, "Connection")) {
             strtok_r(position, ":", &position);
             char* value = position+1; // + 1 to skip over ' '
             if (cstrncmp(value, "keep-alive") == 0) o->keep_alive = true;
-            // else o->keep_alive = false;
         }
     }
     return 0;
@@ -163,7 +161,6 @@ void handle_sigpipe(int signumber) {
 }
 
 
-// TODO: handle SIGPIPE
 int handle_connection(int remotefd) {
     int result = 0;
     #ifndef IPV4
@@ -208,7 +205,7 @@ int handle_connection(int remotefd) {
                 &in_buf[in_filled-sizeof(HTTP_END)+1], // +1 because sizeof(STRING) includes null terminator
                 HTTP_END,
                 sizeof(HTTP_END)-1) // don't include null terminator in check
-                // NOTE: if request had a body (i.e. POST request), it would be incorrect to assume it ends here
+            // NOTE: if request had a body (i.e. POST request), it would be incorrect to assume it ends here
             ) break; // end of message
             if (in_filled == sizeof(in_buf)) { // buffer limit reached
                 // TODO: return 413
@@ -412,7 +409,7 @@ int main(void) {
             NULL,
             thread_routine,
             /* pthread_create takes a pointer to the argument struct. however,
-            * since we only have one argument, we can pass it directly */
+            * since we only have one argument, why not pass it directly? */
             (void*)&remotefds[i]
         );
     }
