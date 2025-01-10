@@ -1,41 +1,22 @@
-#define _POSIX_C_SOURCE 199309L
-#include <arpa/inet.h>
+#include "common.h"
+
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/sendfile.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <netinet/in.h>
-#include <stdio.h>
 #include <unistd.h>
-#include <string.h>
 #include <strings.h>
 #include <stdbool.h>
-#include <errno.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <fcntl.h>
 #include <pthread.h>
 
-#define countof(x) (sizeof(x)/sizeof(x[0]))
-#define logformat(format, ...) "%s:%d (%s) " format "\n",  __FILE__, __LINE__, __func__ __VA_OPT__(,) __VA_ARGS__
-#define log(format, ...) printf(logformat(format, ##__VA_ARGS__))
-#define log_error(format, ...) fprintf(stderr, logformat(format, ##__VA_ARGS__))
-// NOTE:  errno is unsafe in a multithreaded environment (I'm not sure what to do about it)
-#define log_errno() fprintf(stderr, logformat("errno: %s", strerror(errno)))
-#define exit_errno() {log_errno(); exit(EXIT_FAILURE);}
-#define HTON_IP(a, b, c, d) (a<<8*0|b<<8*1|c<<8*2|d<<8*3)
-#define HTON_PORT(port) (uint16_t)((uint8_t)port<<8|(uint16_t)port>>8)
-#define cstrncmp(s1, s2) strncmp(s1, s2, sizeof(s2)-1)
 
-const in_port_t HOST_PORT = 8008;
-#ifndef IPV4
-const struct in6_addr HOST_ADDR = IN6ADDR_LOOPBACK_INIT;
-#else
-const struct in_addr HOST_ADDR = {.s_addr = HTON_IP(0, 0, 0, 0)};
-#endif
+#define USAGE_STR "usage: server <bind address> <bind port>"
+
+const in_port_t DEFAULT_PORT = 8008;
 const int PAGE_SIZE = 4096;
-const int TRUE = 1;
+
 const struct timeval TIMEOUT = {
     .tv_sec = 2
 };
@@ -43,9 +24,11 @@ const struct timeval TIMEOUT = {
 #define HTTP_NEWLINE "\r\n"
 #define HTTP_END "\r\n\r\n"
 #define HTTP_OK "HTTP/1.1 200 OK"
-#define HTTP_BAD_REQUEST_HEADER "HTTP/1.1 400 Bad Request"HTTP_END
-#define HTTP_MISSING_HEADER "HTTP/1.1 404 Not Found"HTTP_END
-#define HTTP_SERVER_ERROR_HEADER "HTTP/1.1 500 Internal Server Error"HTTP_END
+// "Content-Length" is very important, without it the browser will just hang on the request until timeout.
+#define NO_CONTENT_REPLY(msg, msglen) "HTTP/1.1 "msg HTTP_NEWLINE"Content-Length: " #msglen HTTP_END msg
+const char HTTP_BAD_REQUEST[] = NO_CONTENT_REPLY("400 Bad Request", 15);
+const char HTTP_MISSING[] = NO_CONTENT_REPLY("404 Not Found", 13);
+const char HTTP_SERVER_ERROR[] = NO_CONTENT_REPLY("500 Internal Server Error", 25);
 
 typedef enum {
     GET,
@@ -58,6 +41,7 @@ char* content_type_ext[] = {
     "js",
     "png",
     "webp",
+    "gif",
 };
 
 char* content_type_str[] = {
@@ -66,6 +50,7 @@ char* content_type_str[] = {
     "application/javascript",
     "image/png",
     "image/webp",
+    "image/gif",
 };
 
 typedef enum {
@@ -88,19 +73,15 @@ int *remotefds;
 
 char root[256];
 #ifndef IPV4
-const struct sockaddr_in6 host_address = {
+struct sockaddr_in6 host_address = {
     .sin6_family = AF_INET6,
-    .sin6_addr = HOST_ADDR,
-    .sin6_port = HTON_PORT(HOST_PORT)
     // .sin6_flowinfo = 0, // reserved field
     // .sin6_scope_id = 0 // no idea what this is
 };
 char host_addr_str[INET6_ADDRSTRLEN];
 #else
-const struct sockaddr_in host_address = {
+struct sockaddr_in host_address = {
     .sin_family = AF_INET,
-    .sin_addr = HOST_ADDR,
-    .sin_port = HTON_PORT(HOST_PORT)
 };
 char host_addr_str[INET_ADDRSTRLEN];
 #endif
@@ -124,8 +105,6 @@ int parse_header(char* header, HttpHeader* o) {
     log("requesting resource: %s", o->resource);
 
     char *file_ext_str = strrchr(o->resource, (int)'.');
-    if (file_ext_str > strrchr(o->resource, (int)'\n')) file_ext_str = NULL;
-    o->content_type = "";
     if (file_ext_str) {
         for (size_t i = 0; i < countof(content_type_ext); i++) {
             // TODO: is this unsafe?
@@ -136,7 +115,7 @@ int parse_header(char* header, HttpHeader* o) {
         }
     }
 
-    char* version_str = strtok_r(NULL, "\n", &position);
+    char* version_str = strtok_r(NULL, "\r", &position);
     if (!version_str || cstrncmp(version_str, "HTTP/1.1") != 0) return -1;
     // iterate over attributes in `Key: Value\r\n` format
     for (;;) {
@@ -225,28 +204,36 @@ int handle_connection(int remotefd) {
         // PROCESS REQUEST
 
         if (-1 == parse_header(in_buf, &conn_header)) goto return_bad_request;
-        if (-1 == access(conn_header.resource, F_OK)) {
-            log_error("resource unavailable (%s)", conn_header.resource);
-            goto return_missing;
-        }
-        int resourcefd = open(conn_header.resource, O_RDONLY);
-        if (0 > resourcefd) {log_errno(); goto return_server_error;};
-
         struct stat fst;
-        if (0 != stat(conn_header.resource, &fst)) {log_errno(); goto return_server_error;}
+        if (0 != stat(conn_header.resource, &fst)) {
+            log_errno();
+            if (ENOENT == errno) goto return_missing;
+            goto return_server_error;
+        }
+        if (S_ISDIR(fst.st_mode)) goto return_missing; // is directory
+        int resourcefd = open(conn_header.resource, O_RDONLY);
+        if (0 > resourcefd) {log_errno(); goto return_server_error;}
+
 
         // ANSWER REQUEST
 
+        // this could probably become a macro
         out_filled = snprintf(out_buf, sizeof(out_buf),
             HTTP_OK HTTP_NEWLINE
-            "Content-Length: %ld" HTTP_NEWLINE
-            "Content-Type: %s" HTTP_NEWLINE
-            HTTP_NEWLINE,
+            "Content-Length: %ld" HTTP_NEWLINE,
 
-            fst.st_size,
-            conn_header.content_type
+            fst.st_size
         );
-        if (sizeof(out_buf) == out_filled && out_buf[out_filled-1] != '\00') {
+        if (conn_header.content_type)
+            out_filled += snprintf(out_buf+out_filled, sizeof(out_buf)-out_filled,
+                "Content-Type: %s" HTTP_NEWLINE,
+                conn_header.content_type
+            );
+        out_filled += snprintf(out_buf+out_filled, sizeof(out_buf)-out_filled, HTTP_NEWLINE);
+
+        if (sizeof(out_buf) <= out_filled
+            && out_buf[sizeof(out_buf)-1] != '\00' // snprintf includes terminating null byte
+        ) {
             // header response is too big
             // TODO: return 413 (?)
             goto return_server_error;
@@ -262,11 +249,7 @@ int handle_connection(int remotefd) {
         // RESPONSE BODY
 
         ssize_t file_read;
-        #if TYPE != 1 && TYPE != 2
-        #define TYPE 2
-        //#error "define TYPE 1 or 2"
-        #endif
-        #if TYPE == 1
+        #ifdef NOSENDFILE
         bool continue_reading = true;
         for (;;) {
             // fill buffer before sending
@@ -299,7 +282,7 @@ int handle_connection(int remotefd) {
             if (0 > sent) {log_errno(); goto end_connection;}
             if (!continue_reading) break;
         }
-        #elif TYPE == 2
+        #else
         for (;;) {
             // I've experimented with different `count` param sizes and passing
             // the size of the file seems to be the fastest.
@@ -312,19 +295,19 @@ int handle_connection(int remotefd) {
 
         }
         #endif
-        if (0 != close(resourcefd))
+        if (0 != close(resourcefd)) log_errno();
 
         log("sent %ld+%ld bytes (header+content)", sent-fst.st_size, fst.st_size);
         if (!conn_header.keep_alive) goto end_connection;
         continue;
         return_missing:
-            sent += write(remotefd, &HTTP_MISSING_HEADER, sizeof(HTTP_MISSING_HEADER)-1);
+            sent += write(remotefd, HTTP_MISSING, sizeof(HTTP_MISSING)-1);
             goto return_fail;
         return_bad_request:
-            sent += write(remotefd, &HTTP_BAD_REQUEST_HEADER, sizeof(HTTP_BAD_REQUEST_HEADER)-1);
+            sent += write(remotefd, HTTP_BAD_REQUEST, sizeof(HTTP_BAD_REQUEST)-1);
             goto return_fail;
         return_server_error:
-            sent += write(remotefd, &HTTP_SERVER_ERROR_HEADER, sizeof(HTTP_SERVER_ERROR_HEADER)-1);
+            sent += write(remotefd, HTTP_SERVER_ERROR, sizeof(HTTP_SERVER_ERROR)-1);
             goto return_fail;
         return_fail:
             log("sent %ld bytes", sent);
@@ -349,8 +332,8 @@ void *thread_routine(void *args) {
     int result;
     do {
         /* we can avoid compiler warnings here by
-        * 1. casting to long since bigger->smaller cast warning is only for void* (route chosen)
-        * 2. -Wno-int-to-void-pointer-cast (or wrap in some pragma that localizes it) */
+        * 1. casting to long since bigger->smaller cast warning is only for void* (path chosen)
+        * 2. -Wno-int-to-void-pointer-cast (or wrap in some pragma that suppresses it) */
         result = handle_connection((int)(long)args);
     // } while (0 == result);
     } while (1);
@@ -369,16 +352,39 @@ void handle_exit(int signumber) {
     exit(EXIT_SUCCESS);
 }
 
-int main(void) {
-    if (NULL == getcwd(root, countof(root))) exit_errno();
+int main(int argc, char **argv) {
+    if (1 == argc) {
+        #ifndef IPV4
+        host_address.sin6_addr = ANY_ADDR;
+        host_address.sin6_port = HTON_PORT(DEFAULT_PORT);
+        #else
+        host_address.sin_addr = ANY_ADDR;
+        host_address.sin_port = HTON_PORT(DEFAULT_PORT);
+        #endif
+    } else if (3 == argc) {
+        #ifndef IPV4
+        if (1 != inet_pton(AF, argv[1], &host_address.sin6_addr)) {
+        #else
+        if (1 != inet_pton(AF, argv[1], &host_address.sin_addr)) {
+        #endif
+            log("invalid address: %s", argv[1]);
+            exit(EXIT_FAILURE);
+        }
+        #ifndef IPV4
+        host_address.sin6_port = HTON_PORT(strtous(argv[2], NULL, 10));
+        #else
+        host_address.sin_port = HTON_PORT(strtous(argv[2], NULL, 10));
+        #endif
+    } else {
+        log("usage: server [<bind address> <bind port>]");
+        exit(EXIT_FAILURE);
+    }
+
+    bail_errno(NULL == getcwd(root, countof(root)));
     printf("root dir:\t%s\n", root);
     // signal(SIGTERM, handle_exit);
     signal(SIGINT, handle_exit);
-    #ifndef IPV4
-    hostfd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    #else
-    hostfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    #endif
+    hostfd = socket(AF, SOCK_STREAM, IPPROTO_TCP);
     if (0 > hostfd) exit_errno();
     // drop late packets after closing socket, enabling us to quickly restart the program
     if (0 != setsockopt(hostfd, SOL_SOCKET, SO_REUSEADDR, &TRUE, sizeof(TRUE)))
@@ -392,11 +398,11 @@ int main(void) {
     // checkpoint: socket is ready for connections
     printf("socket fd:\t%d\npid:\t\t%d\nparent pid:\t%d\n", hostfd, getpid(), getppid());
     #ifndef IPV4
-    inet_ntop(AF_INET6, &host_address.sin6_addr, host_addr_str, INET6_ADDRSTRLEN);
-    printf("http://[%s]:%d\n", host_addr_str, HOST_PORT);
+    inet_ntop(AF, &host_address.sin6_addr, host_addr_str, INET6_ADDRSTRLEN);
+    printf("http://[%s]:%d\n", host_addr_str, HTON_PORT(host_address.sin6_port));
     #else
-    inet_ntop(AF_INET, &host_address.sin_addr, host_addr_str, INET_ADDRSTRLEN);
-    printf("http://%s:%d\n", host_addr_str, HOST_PORT);
+    inet_ntop(AF, &host_address.sin_addr, host_addr_str, HTON_PORT(host_address.sin_port));
+    printf("http://%s:%d\n", host_addr_str, HTON_PORT(host_address.sin_port));
     #endif
 
     // setup threads

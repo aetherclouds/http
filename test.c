@@ -1,29 +1,13 @@
 #define _POSIX_C_SOURCE 199309L
-#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
-#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 #include <time.h>
 #include <stdbool.h>
 
-#define countof(x) (sizeof(x)/sizeof(x[0]))
-#define logformat(format, ...) "%s:%d (%s) " format,  __FILE__, __LINE__, __func__ __VA_OPT__(,) __VA_ARGS__
-#define log(format, ...) printf(logformat(format "\n", ##__VA_ARGS__))
-#define log_error(format, ...) fprintf(stderr, logformat(format "\n", ##__VA_ARGS__))
-#define log_errno() fprintf(stderr, logformat("errno: %s", strerror(errno)))
-#define exit_errno() {log_errno(); exit(EXIT_FAILURE);}
-#define bail(cond, format, ...) if (cond) {log_error(format, ##__VA_ARGS__); exit(EXIT_FAILURE);}
-#define bail_errno(cond) if (cond) exit_errno()
-#define HTON_IP(a, b, c, d) (a<<8*0|b<<8*1|c<<8*2|d<<8*3)
-#define HTONS(port) (uint16_t)((uint8_t)port<<8|(uint16_t)port>>8)
-const int TRUE = 1;
-const int ZERO = 0;
 const char send_header_fmt[] =
 "GET /%s HTTP/1.1\r\n"
 "Host: [::1]:8008\r\n"
@@ -50,7 +34,7 @@ struct sockaddr_in remoteaddr = {
     .sin_family = AF_INET
 };
 
-#define USAGE_STR "usage: ./test <samples> <ipv4> <port> <resource(optional)>"
+#define USAGE_STR "usage: test <samples> <ipv4> <port> <resource(optional)>"
 
 int main(int argc, char *argv[]) {
     int result;

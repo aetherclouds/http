@@ -1,20 +1,17 @@
-# MACROS:
-# IPV4 - IPv4 support (default IPv6)
-# TYPE: 1 | 2 - 1. buffered write, 2. sendfile (default 2)
-
-CFLAGS :=
+FLAGS :=
+CFLAGS := -std=c23 -Wall -Wextra
 OUTFILE := server
 
 .PHONY: run prod deb
 
-run: deb
-	bin/$(OUTFILE)
+run: bin/$(OUTFILE)
+	$<
 
-prod: TFLAGS := -O3
+prod: CFLAGS +=-O3
 prod: bin/$(OUTFILE)
 
-deb: TFLAGS := -g
+deb: CFLAGS += -ggdb3
 deb: bin/$(OUTFILE)
 
 bin/$(OUTFILE): main.c
-	gcc -o $@ $< -std=c23 -Wall -Wextra $(CFLAGS) $(TFLAGS)
+	gcc -o $@ $< $(CFLAGS) $(FLAGS)
