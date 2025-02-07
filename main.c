@@ -5,7 +5,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <strings.h>
-#include <stdbool.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -15,7 +14,6 @@
 #define USAGE_STR "usage: server <bind address> <bind port>"
 
 const in_port_t DEFAULT_PORT = 8008;
-const int PAGE_SIZE = 4096;
 
 const struct timeval TIMEOUT = {
     .tv_sec = 2
@@ -29,6 +27,7 @@ const struct timeval TIMEOUT = {
 const char HTTP_BAD_REQUEST[] = NO_CONTENT_REPLY("400 Bad Request", 15);
 const char HTTP_MISSING[] = NO_CONTENT_REPLY("404 Not Found", 13);
 const char HTTP_SERVER_ERROR[] = NO_CONTENT_REPLY("500 Internal Server Error", 25);
+const char HTTP_REQUEST_ENTITY_TOO_LARGE[] = NO_CONTENT_REPLY("413 Request Entity Too Large", 28);
 
 typedef enum {
     GET,
@@ -116,7 +115,7 @@ int parse_header(char* header, HttpHeader* o) {
     }
 
     char* version_str = strtok_r(NULL, "\r", &position);
-    if (!version_str || cstrncmp(version_str, "HTTP/1.1") != 0) return -1;
+    if (!version_str) return -1;
     // iterate over attributes in `Key: Value\r\n` format
     for (;;) {
         position = strchr(position, '\n')+1;
@@ -164,33 +163,39 @@ int handle_connection(int remotefd) {
     log("new connection: %s:%d\n", ext_addr_str, ntohs(conn_address.sin_port));
     #endif
 
-    ssize_t received = 0, sent = 0;
     char in_buf[PAGE_SIZE], out_buf[PAGE_SIZE];
     for (;;) { // iterate over messages (http1.1 or above)
+        ssize_t sent = 0; // per HTTP message
+        /* I chose to limit the receiving HTTP header size to a reasonable limit (8KB) which is the size of in_buf.
+         so we won't be reusing the buffer (i.e. resetting `in_filled` to 0). */
+        #define received in_filled
         size_t in_filled = 0, out_filled = 0;
+        
+        // RECEIVE REQUEST
+
         for (;;) { // iterate over packets
-            received = read(remotefd, &in_buf[in_filled], sizeof(in_buf) - in_filled);
-            if (received == 0) {
+            if (0 >= (result = read(remotefd, &in_buf[in_filled], sizeof(in_buf) - in_filled))) {
+                if (0 > result) {
+                    log_errno();
+                    goto end_error;
+                }
                 log("connection closed on remote end");
                 goto end_connection;
             }
-            if (0 > received) {
-                log_errno();
-                goto end_error;
-            }
-            in_filled += received;
-            log("received %ld bytes:", received);
+            in_filled += result;
             if (0 == strncmp(
-                &in_buf[in_filled-sizeof(HTTP_END)+1], // +1 because sizeof(STRING) includes null terminator
+                &in_buf[in_filled-sizeof(HTTP_END)+1], 
                 HTTP_END,
-                sizeof(HTTP_END)-1) // don't include null terminator in check
+                sizeof(HTTP_END)-1) // null terminator offset
             // NOTE: if request had a body (i.e. POST request), it would be incorrect to assume it ends here
             ) break; // end of message
-            if (in_filled == sizeof(in_buf)) { // buffer limit reached
-                // TODO: return 413
-                goto return_server_error;
+            // NOTE: might arrive here if request DOES have HTTP_END but is encrypted (HTTPS)
+            if (in_filled >= sizeof(in_buf)) { // buffer limit reached
+                goto return_entity_too_large;
             }
         }
+        log("received %ld bytes:", received);
+
         // int dumpfile = open("./dump", O_CREAT|O_RDWR, S_IRWXU);
         // log("fd %d", dumpfile);
         // log("wrote %d", write(dumpfile, in_buf, in_filled));
@@ -210,89 +215,88 @@ int handle_connection(int remotefd) {
             if (ENOENT == errno) goto return_missing;
             goto return_server_error;
         }
-        if (S_ISDIR(fst.st_mode)) goto return_missing; // is directory
+        // check if file is actually a directory
+        if (S_ISDIR(fst.st_mode)) goto return_missing; 
+        
         int resourcefd = open(conn_header.resource, O_RDONLY);
         if (0 > resourcefd) {log_errno(); goto return_server_error;}
 
-
         // ANSWER REQUEST
 
-        // this could probably become a macro
-        out_filled = snprintf(out_buf, sizeof(out_buf),
+        #define write_header(format, ...) out_filled += snprintf(\
+            out_buf+out_filled, sizeof(out_buf)-out_filled,\
+            format, ##__VA_ARGS__)
+
+        write_header(
             HTTP_OK HTTP_NEWLINE
             "Content-Length: %ld" HTTP_NEWLINE,
-
             fst.st_size
         );
         if (conn_header.content_type)
-            out_filled += snprintf(out_buf+out_filled, sizeof(out_buf)-out_filled,
+            write_header(
                 "Content-Type: %s" HTTP_NEWLINE,
                 conn_header.content_type
             );
-        out_filled += snprintf(out_buf+out_filled, sizeof(out_buf)-out_filled, HTTP_NEWLINE);
+        write_header(HTTP_NEWLINE);
 
         if (sizeof(out_buf) <= out_filled
-            && out_buf[sizeof(out_buf)-1] != '\00' // snprintf includes terminating null byte
-        ) {
-            // header response is too big
-            // TODO: return 413 (?)
-            goto return_server_error;
-        }
-        sent = write(remotefd, &out_buf, strlen(out_buf));
+            && '\00' != out_buf[sizeof(out_buf)-1] // snprintf includes terminating null byte
+            // response header is too big
+        ) goto return_entity_too_large;
+
         // past this point, if we error, it means server/critical failure or socket is broken.
         // let's not even attempt to return an error - just close the connection.
-        if (0 >= sent) {
+        if (0 >= (result = write(remotefd, &out_buf, strlen(out_buf)))) {
             log_errno();
-            goto end_connection;
+            goto end_error;
         }
+        sent += result;
 
         // RESPONSE BODY
 
-        ssize_t file_read;
         #ifdef NOSENDFILE
         bool continue_reading = true;
-        for (;;) {
-            // fill buffer before sending
+        do { // reuse buffer if it gets full
             out_filled = 0;
-            for (;;) {
+            for (;;) {// `read` doesn't always return its maximum read size
                 // file descriptor seeks forward on every read
-                file_read = read(
+                result = read(
                     resourcefd,
                     &out_buf[out_filled],
                     sizeof(out_buf)-out_filled
                 );
-                if (0 >= file_read) {
-                    if (0 == file_read) {
+                if (0 >= result) {
+                    if (0 == result) {
                         // reached EOF
                         continue_reading = false;
                         break;
-                    }
-                    // else:
+                    } // else:
                     log_errno();
-                    goto end_connection;
+                    goto end_error;
                 }
-                out_filled += file_read;
-                if (out_filled == sizeof(out_buf)) {
-                    // buffer full
+                out_filled += result;
+                if (out_filled == sizeof(out_buf))// buffer full
                     break; // write to socket and continue reading file
-                }
             }
             // checkpoint: EOF or buffer full
-            sent += write(remotefd, out_buf, out_filled);
-            if (0 > sent) {log_errno(); goto end_connection;}
-            if (!continue_reading) break;
-        }
+            result = write(remotefd, out_buf, out_filled);
+            if (0 > result) {log_errno(); goto end_error;}
+            sent += result;  
+        } while (continue_reading);
         #else
         for (;;) {
             // I've experimented with different `count` param sizes and passing
             // the size of the file seems to be the fastest.
-            if (0 >= (file_read = sendfile(remotefd, resourcefd, NULL, fst.st_size))) {
-                if (0 > file_read) log_errno();
-                // broken pipe, client might have closed connection prematurely
-                if (EPIPE == file_read) return -1;
+            if (0 >= (result = sendfile(remotefd, resourcefd, NULL, fst.st_size))) {
+                if (0 > result) {
+                    // EPIPE: broken pipe, client might have closed connection prematurely
+                    log_errno();
+                    return -1;
+                }
+                // EOF
                 break;
-            } else sent += file_read;
-
+            } 
+            sent += result;
         }
         #endif
         if (0 != close(resourcefd)) log_errno();
@@ -300,6 +304,7 @@ int handle_connection(int remotefd) {
         log("sent %ld+%ld bytes (header+content)", sent-fst.st_size, fst.st_size);
         if (!conn_header.keep_alive) goto end_connection;
         continue;
+        // TODO: how to avoid repetition here?
         return_missing:
             sent += write(remotefd, HTTP_MISSING, sizeof(HTTP_MISSING)-1);
             goto return_fail;
@@ -309,9 +314,12 @@ int handle_connection(int remotefd) {
         return_server_error:
             sent += write(remotefd, HTTP_SERVER_ERROR, sizeof(HTTP_SERVER_ERROR)-1);
             goto return_fail;
+        return_entity_too_large:
+            sent += write(remotefd, HTTP_REQUEST_ENTITY_TOO_LARGE, sizeof(HTTP_REQUEST_ENTITY_TOO_LARGE)-1);
+            goto return_fail;
         return_fail:
-            log("sent %ld bytes", sent);
-            if (!conn_header.keep_alive) goto end_connection;
+            log("sent %ld bytes with error", sent);
+            if (!conn_header.keep_alive) goto end_error;
             continue;
     }
     end_error:

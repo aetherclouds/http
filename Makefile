@@ -15,3 +15,6 @@ deb: bin/$(OUTFILE)
 
 bin/$(OUTFILE): main.c
 	gcc -o $@ $< $(CFLAGS) $(FLAGS)
+
+bin/measure: measure.c
+	gcc -o $@ $< $(CFLAGS) $(FLAGS)

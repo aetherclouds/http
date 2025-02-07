@@ -1,12 +1,7 @@
-#define _POSIX_C_SOURCE 199309L
-#include <arpa/inet.h>
-#include <netinet/tcp.h>
+#include "common.h"
 #include <fcntl.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <string.h>
 #include <time.h>
-#include <stdbool.h>
 
 const char send_header_fmt[] =
 "GET /%s HTTP/1.1\r\n"
@@ -25,16 +20,16 @@ const char send_header_fmt[] =
 "\r\n";
 char send_header[sizeof(send_header_fmt) + 256];
 
-const struct sockaddr_in hostaddr = {
+struct sockaddr_in hostaddr = {
     .sin_family = AF_INET,
-    .sin_addr = INADDR_ANY,
-    .sin_port = HTONS(9999),
+    .sin_addr = ANY_ADDR4, // a bit leaky since incoming data will be broadcasted to every local device
+    .sin_port = HTON_PORT(9999),
 };
 struct sockaddr_in remoteaddr = {
     .sin_family = AF_INET
 };
 
-#define USAGE_STR "usage: test <samples> <ipv4> <port> <resource(optional)>"
+#define USAGE_STR "usage: measure <samples> <ipv4> <port> <resource(optional)>"
 
 int main(int argc, char *argv[]) {
     int result;
@@ -51,7 +46,7 @@ int main(int argc, char *argv[]) {
 
     char* resource;
     if (argc == 5) resource = argv[4];
-    else resource = (char*)&ZERO;
+    else resource = (char*)&FALSE;
     snprintf(send_header, sizeof(send_header), send_header_fmt, resource);
 
     double filesize = -1;
@@ -59,7 +54,7 @@ int main(int argc, char *argv[]) {
         long errored = 0;
         int sockfd;
         int received, sent;
-        char received_buf[4098*4];
+        char received_buf[PAGE_SIZE*16];
         struct timespec start, end;
 
         bail_errno(0 > (sockfd = socket(AF_INET, SOCK_STREAM, 0)));
@@ -71,7 +66,7 @@ int main(int argc, char *argv[]) {
             if (0 > connect(sockfd, (struct sockaddr*)&remoteaddr, sizeof(remoteaddr))) {
                 ++errored;
                 // TODO: doesn't show up on my terminal without a newline. buffered?
-                printf(logformat("sample %d, attempt %ld: address taken, retrying\r", i, errored));
+                printf(logformat_nonl("sample %d, attempt %ld: address taken, retrying\r", i, errored));
             } else break;
         }
 
@@ -113,7 +108,7 @@ int main(int argc, char *argv[]) {
         average += samples[i] / (float)n_samples;
     }
 
-    printf("avg: %fs (%fmb/s)\nsamples: %d\n", average, (filesize/1000/1000)/average, n_samples);
+    printf("avg. %fs (%fmb/s)\nsamples: %d\n", average, (filesize/1000/1000)/average, n_samples);
 
     return 0;
 }
